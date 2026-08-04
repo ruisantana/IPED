@@ -100,7 +100,7 @@ public class RAGService {
         // Initialize Embedding Provider
         String embProv = config.getEmbeddingProvider();
         if ("local".equalsIgnoreCase(embProv)) {
-            this.embeddingProvider = new LocalEmbeddingProvider(config.getEmbeddingEndpoint(), config.getEmbeddingModel());
+            this.embeddingProvider = new LocalEmbeddingProvider(config.getEmbeddingEndpoint(), config.getEmbeddingModel(), config.getSubBatchSize());
         } else if ("gemini".equalsIgnoreCase(embProv)) {
             this.embeddingProvider = new GeminiEmbeddingProvider(config.getEmbeddingEndpoint(), config.getEmbeddingModel(), config.getLlmApiKey(), config.getEmbeddingDimensions());
         } else {
@@ -737,7 +737,7 @@ public class RAGService {
             while (cleanedQuestion.endsWith("?") || cleanedQuestion.endsWith(".") || cleanedQuestion.endsWith("!")) {
                 cleanedQuestion = cleanedQuestion.substring(0, cleanedQuestion.length() - 1).trim();
             }
-            cleanedQuestion = cleanedQuestion.replaceAll("[\\+\\-\\&\\|\\!\\(\\)\\{\\}\\[\\]\\^\\\"\\~\\*\\?\\:\\\\\\/]", " ");
+            cleanedQuestion = cleanedQuestion.replaceAll("[\\+\\-\\&\\|\\!\\(\\)\\{\\}\\[\\]\\^\\\"\\~\\*\\?\\:\\\\\\/@]", " ");
             cleanedQuestion = cleanedQuestion.trim().replaceAll("\\s+", " ");
         }
 
@@ -765,7 +765,30 @@ public class RAGService {
                 wordsQuery = bqBuilder.build();
             }
         } catch (org.apache.lucene.queryparser.flexible.core.QueryNodeException e) {
-            throw new IOException("Failed to parse lexical query: " + question, e);
+            // Graceful fallback: build a simple term-by-term query instead of failing.
+            // This handles questions containing emails (user@domain.com), URLs, SQL, or
+            // any other text with characters that the Lucene query parser cannot handle.
+            LOGGER.warn("Lucene query parser failed for '{}', falling back to simple term query: {}", question, e.getMessage());
+            String[] tokens = cleanedQuestion.toLowerCase().split("\\s+");
+            BooleanQuery.Builder fallbackBuilder = new BooleanQuery.Builder();
+            int validTokens = 0;
+            for (String token : tokens) {
+                token = token.trim();
+                if (!token.isEmpty() && token.length() >= 2) {
+                    fallbackBuilder.add(
+                            new TermQuery(new Term(iped.properties.BasicProps.CONTENT, token)),
+                            BooleanClause.Occur.SHOULD);
+                    validTokens++;
+                }
+            }
+            if (validTokens > 0) {
+                int minMatch = Math.max(1, (int) (validTokens * 0.4));
+                fallbackBuilder.setMinimumNumberShouldMatch(minMatch);
+                wordsQuery = fallbackBuilder.build();
+            } else {
+                // Query had no usable tokens (e.g. single-char input): return nothing rather than everything.
+                wordsQuery = new org.apache.lucene.search.MatchNoDocsQuery();
+            }
         }
 
         BooleanQuery.Builder boolBuilder = new BooleanQuery.Builder();
